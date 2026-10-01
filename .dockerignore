@@ -1,0 +1,8 @@
+# Root build context (used by the web image). Keep secrets and bulky local
+# folders out of it.
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+apps/api/keys
+.git

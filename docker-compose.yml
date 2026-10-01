@@ -1,0 +1,55 @@
+version: "3.9"
+
+# LOCAL DEVELOPMENT infrastructure only (Postgres, Redis, MinIO) -- the API
+# and web app run on the host (README "Getting started"). Ports are bound to
+# 127.0.0.1 so a laptop doesn't expose a database with a well-known password
+# to its network. For production use docker-compose.prod.yml.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vanijya_sampada
+      POSTGRES_PASSWORD: vanijya_sampada_dev_pw
+      POSTGRES_DB: vanijya_sampada
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vanijya_sampada"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: vanijya_sampada_minio
+      MINIO_ROOT_PASSWORD: vanijya_sampada_minio_dev_pw
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - miniodata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

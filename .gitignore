@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+apps/api/keys/*.pem
+logs/
+*.log
+.DS_Store
+coverage/
+
+# Production backups (scripts/backup.sh) -- contain personal data; never commit
+backups/

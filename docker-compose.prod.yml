@@ -1,0 +1,157 @@
+# PRODUCTION stack. Only the web server publishes a port; the API, database,
+# Redis and MinIO are reachable solely inside this network. That is what
+# makes TRUST_PROXY=1 safe: nobody can reach the API directly with a forged
+# X-Forwarded-For. Secrets come from .env and are REQUIRED (no defaults).
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vanijya_sampada
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: vanijya_sampada
+    # Part VII RPO <= 15 min: continuous WAL archiving. A segment is archived
+    # when full or at least every 5 minutes (archive_timeout), so at most ~5
+    # minutes of committed data are at risk. Base backups + this archive allow
+    # point-in-time recovery (scripts/restore-pitr.sh).
+    # The archive volume is created root-owned, but Postgres runs as the
+    # `postgres` user: without this chown, archive_command fails and Postgres
+    # keeps every WAL segment in pg_wal until the disk fills. The official
+    # entrypoint starts as root, so fix ownership, then hand over to it.
+    entrypoint: ["sh", "-c", "chown postgres:postgres /wal-archive && exec docker-entrypoint.sh \"$$@\"", "--"]
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /wal-archive/%f && cp %p /wal-archive/%f
+      - -c
+      - archive_timeout=300
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - walarchive:/wal-archive
+      - ./scripts/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vanijya_sampada"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}
+    volumes:
+      - miniodata:/data
+
+  api:
+    # Built image (apps/api/Dockerfile): runs `prisma migrate deploy`, then
+    # the compiled server. No source bind-mount -- the old compose mounted
+    # the source over /app, hiding dist/, so the API could not start.
+    build:
+      context: ./apps/api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://vanijya_sampada:${POSTGRES_PASSWORD}@postgres:5432/vanijya_sampada?schema=public
+      REDIS_URL: redis://redis:6379
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      TRUST_PROXY: "1"      # exactly one hop: the web server below
+      APP_VERSION: ${APP_VERSION:-unversioned}   # build identifier (§5.7), e.g. the Git commit SHA
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:?set MINIO_PUBLIC_URL (the site's public origin) in .env}
+    volumes:
+      # JWT keys mounted read-only at run time -- never baked into the image
+      # (apps/api/.dockerignore excludes them). Generate with
+      # scripts/generate-jwt-keys.sh on the server.
+      - ./apps/api/keys:/app/keys:ro
+
+  web:
+    # nginx serving the built web app, proxying /api and stored files.
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+      args:
+        VITE_CAPTCHA_PROVIDER: ${CAPTCHA_PROVIDER:-builtin}   # built-in: self-hosted, no key needed
+        VITE_CAPTCHA_SITE_KEY: ${CAPTCHA_SITE_KEY:-}          # only for recaptcha/hcaptcha
+        VITE_APP_VERSION: ${APP_VERSION:-unversioned}
+    restart: unless-stopped
+    depends_on:
+      - api
+      - minio
+    environment:
+      MINIO_BUCKET: ${MINIO_BUCKET:-vanijya-sampada-files}
+      # Origins the captcha widget loads from (recaptcha default; for hcaptcha use
+      # "https://hcaptcha.com https://*.hcaptcha.com").
+      # Built-in captcha: nothing external. For recaptcha set e.g.
+      # "https://www.google.com https://www.gstatic.com https://recaptcha.google.com".
+      CAPTCHA_CSP_SOURCES: ${CAPTCHA_CSP_SOURCES:-}
+    ports:
+      - "80:80"
+
+  # Backups: never started with the stack (profile). Run scripts/backup.sh
+  # (e.g. from cron). Postgres image = pg_dump/pg_restore + tar + sh.
+  backup:
+    image: postgres:16-alpine
+    profiles: ["backup"]
+    depends_on:
+      - postgres
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - miniodata:/files:ro          # stored files, read-only
+      - ./backups:/backup
+      - walarchive:/wal-archive      # pruned in step with base backups
+      - ./scripts/backup-inside.sh:/usr/local/bin/backup-inside.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/backup-inside.sh"]
+
+  # Restore (scripts/restore.sh): like `backup` but with the files volume
+  # WRITABLE. A dedicated service so compose resolves `miniodata` to this
+  # project's volume -- `docker compose run -v miniodata:...` would name a
+  # different, empty volume and "restore" into nothing.
+  restore:
+    image: postgres:16-alpine
+    profiles: ["restore"]
+    depends_on:
+      - postgres
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - miniodata:/files
+      - ./backups:/backup:ro
+      - walarchive:/wal-archive:ro
+      - pgdata:/pgdata               # point-in-time restore writes the database volume
+    entrypoint: ["sh"]
+
+volumes:
+  pgdata:
+  walarchive:
+  redisdata:
+  miniodata:
